@@ -108,6 +108,93 @@ def test_time_parameterization_flags_infeasible_profile():
     assert trajectory.samples[-1].v <= trajectory.max_speed
 
 
+def _profile_derivatives(samples):
+    """Average accel per interval and jerk between interval midpoints (exact for the
+    piecewise-linear-accel profiles produced here)."""
+    accels = []
+    for a, b in zip(samples, samples[1:]):
+        dt = b.t - a.t
+        if dt > 1e-12:
+            accels.append((0.5 * (a.t + b.t), (b.v - a.v) / dt))
+    jerks = [(b[1] - a[1]) / (b[0] - a[0]) for a, b in zip(accels, accels[1:])]
+    return [a for _, a in accels], jerks
+
+
+def test_jerk_limited_profile_respects_speed_accel_and_jerk():
+    points = [(0.0, 0.0), (2.0, 0.0), (4.0, 1.0), (6.0, 1.0)]
+    trajectory = time_parameterize(points, max_speed=1.5, max_accel=0.8, max_jerk=2.0)
+    assert trajectory.feasible, trajectory.violations
+    assert trajectory.max_jerk == 2.0 and trajectory.to_dict()['max_jerk'] == 2.0
+    assert trajectory.samples[0].v == 0.0 and trajectory.samples[-1].v == 0.0
+    times = [s.t for s in trajectory.samples]
+    assert times == sorted(times)
+    assert max(s.v for s in trajectory.samples) <= 1.5 + 1e-9
+    accels, jerks = _profile_derivatives(trajectory.samples)
+    assert accels and max(abs(a) for a in accels) <= 0.8 + 1e-9
+    assert jerks and max(abs(j) for j in jerks) <= 2.0 + 1e-9
+
+
+def test_jerk_limited_profile_stays_smooth_on_long_runs():
+    points = [(float(i), 0.0) for i in range(41)]  # 40 m straight line
+    trajectory = time_parameterize(points, max_speed=3.0, max_accel=2.0, max_jerk=1.5)
+    assert trajectory.feasible, trajectory.violations
+    accels, jerks = _profile_derivatives(trajectory.samples)
+    assert max(abs(a) for a in accels) <= 2.0 + 1e-9
+    assert max(abs(j) for j in jerks) <= 1.5 + 1e-9
+    # long enough to settle into the cruise phase at max speed
+    assert max(s.v for s in trajectory.samples) == pytest.approx(3.0, abs=1e-6)
+
+
+def test_jerk_limited_profile_degrades_instead_of_reporting_infeasible():
+    points = [(0.0, 0.0), (0.02, 0.0), (0.04, 0.0), (0.05, 0.0)]
+    trajectory = time_parameterize(points, max_speed=10.0, max_accel=10.0, max_jerk=5.0)
+    assert trajectory.feasible, trajectory.violations
+    peak = max(s.v for s in trajectory.samples)
+    assert 0.0 < peak < 1.0  # slows itself down instead of failing
+    assert trajectory.samples[-1].v == 0.0
+    accels, jerks = _profile_derivatives(trajectory.samples)
+    assert max(abs(a) for a in accels) <= 10.0 + 1e-9
+    assert max(abs(j) for j in jerks) <= 5.0 + 1e-9
+
+
+def test_tighter_jerk_limit_slows_the_profile():
+    points = [(0.0, 0.0), (2.0, 0.0), (4.0, 1.0), (6.0, 1.0)]
+    stiff = time_parameterize(points, max_speed=1.5, max_accel=0.8, max_jerk=8.0)
+    soft = time_parameterize(points, max_speed=1.5, max_accel=0.8, max_jerk=1.0)
+    assert stiff.feasible and soft.feasible
+    assert soft.duration > stiff.duration
+
+
+def test_jerk_limited_profile_approaches_trapezoid_when_jerk_is_generous():
+    points = [(0.0, 0.0), (2.0, 0.0), (4.0, 1.0), (6.0, 1.0)]
+    jerked = time_parameterize(points, max_speed=1.5, max_accel=0.8, max_jerk=1e6)
+    # Analytic trapezoid: ramp v^2/(2a) at each end, cruise in between.
+    length = 4.0 + math.sqrt(5.0)
+    expected = 2 * (1.5 / 0.8) + (length - 2 * 1.5 ** 2 / (2 * 0.8)) / 1.5
+    assert jerked.duration == pytest.approx(expected, rel=1e-6)
+    assert time_parameterize(points, max_speed=1.5, max_accel=0.8).max_jerk is None
+
+
+def test_jerk_limited_profile_with_moving_endpoints():
+    points = [(0.0, 0.0), (2.0, 0.0), (4.0, 1.0), (6.0, 1.0)]
+    trajectory = time_parameterize(points, max_speed=1.5, max_accel=0.8, max_jerk=2.0,
+                                   start_speed=0.5, end_speed=0.3)
+    assert trajectory.feasible, trajectory.violations
+    assert trajectory.samples[0].v == pytest.approx(0.5)
+    assert trajectory.samples[-1].v == pytest.approx(0.3)
+
+
+def test_jerk_limited_profile_flags_only_physically_impossible_boundaries():
+    trajectory = time_parameterize([(0.0, 0.0), (0.01, 0.0)], max_speed=2.0, max_accel=0.5,
+                                   max_jerk=1.0, start_speed=2.0, end_speed=0.0)
+    assert not trajectory.feasible and trajectory.violations
+
+
+def test_jerk_limit_must_be_positive():
+    with pytest.raises(ValueError):
+        time_parameterize([(0.0, 0.0), (1.0, 0.0)], max_speed=1.0, max_accel=1.0, max_jerk=0.0)
+
+
 # ------------------------------------------------------------------------------ predict
 def test_swept_segment_catches_collision_between_waypoints():
     obstacles = [CircleObstacle(3.0, 0.0, 0.5)]
