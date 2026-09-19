@@ -108,6 +108,90 @@ def test_time_parameterization_flags_infeasible_profile():
     assert trajectory.samples[-1].v <= trajectory.max_speed
 
 
+def _profile_peaks(trajectory, divisions=8192):
+    """Numerically measured max |v|, |a|, |jerk| along the analytic time profile."""
+    from aegisrover.planning.trajectory import _plan_profile
+
+    length = trajectory.samples[-1].s
+    profile = _plan_profile(length, trajectory.max_speed, trajectory.max_accel,
+                            trajectory.max_jerk, trajectory.samples[0].v,
+                            trajectory.samples[-1].v)
+    h = profile.total_time / divisions
+    speeds = [profile.state_at_time(k * h)[0] for k in range(divisions + 1)]
+    accels = [profile.state_at_time(k * h)[1] for k in range(divisions + 1)]
+    jerks = [(accels[k + 1] - accels[k]) / h for k in range(divisions)]
+    return max(speeds), max(abs(a) for a in accels), max(abs(j) for j in jerks)
+
+
+def test_jerk_limit_shapes_the_profile_and_is_respected():
+    points = [(i * 0.25, 0.0) for i in range(81)]  # 20 m straight
+    gentle = time_parameterize(points, max_speed=1.5, max_accel=0.8, max_jerk=0.4)
+    sharp = time_parameterize(points, max_speed=1.5, max_accel=0.8, max_jerk=4.0)
+    assert gentle.feasible and sharp.feasible
+    assert gentle.max_jerk == 0.4
+    # A tighter jerk cap must not be violated anywhere, and must cost time.
+    v_peak, a_peak, j_peak = _profile_peaks(gentle)
+    assert j_peak <= 0.4 + 1e-6
+    assert a_peak <= 0.8 + 1e-6
+    assert v_peak <= 1.5 + 1e-6
+    assert gentle.duration > sharp.duration
+    # Acceleration must start from zero: no instantaneous torque step at departure.
+    from aegisrover.planning.trajectory import _plan_profile
+    profile = _plan_profile(20.0, 1.5, 0.8, 0.4, 0.0, 0.0)
+    _v, a0 = profile.state_at_time(0.0)
+    assert a0 == 0.0
+
+
+def test_default_profile_is_jerk_limited():
+    points = [(i * 0.25, 0.0) for i in range(81)]
+    trajectory = time_parameterize(points, max_speed=1.5, max_accel=0.8)
+    assert trajectory.feasible
+    assert trajectory.max_jerk == pytest.approx(1.6)
+    _v_peak, _a_peak, j_peak = _profile_peaks(trajectory)
+    assert j_peak <= 1.6 + 1e-6
+    assert trajectory.to_dict()['max_jerk'] == pytest.approx(1.6)
+
+
+def test_tight_limits_slow_the_profile_instead_of_failing():
+    points = [(0.0, 0.0), (0.05, 0.0)]  # 5 cm hop
+    trajectory = time_parameterize(points, max_speed=10.0, max_accel=10.0, max_jerk=1.0)
+    assert trajectory.feasible
+    assert trajectory.samples[0].v == 0.0 and trajectory.samples[-1].v == 0.0
+    v_peak, a_peak, j_peak = _profile_peaks(trajectory)
+    # The peak speed collapses far below the generous cap rather than failing.
+    assert v_peak < 0.2
+    assert a_peak <= 10.0 + 1e-6 and j_peak <= 1.0 + 1e-6
+
+
+def test_unreachable_endpoint_speeds_are_lowered_silently():
+    points = [(0.0, 0.0), (0.01, 0.0)]  # 1 cm, asking to enter at 3 m/s, leave at 2 m/s
+    trajectory = time_parameterize(points, max_speed=5.0, max_accel=2.0, max_jerk=1.0,
+                                   start_speed=3.0, end_speed=2.0)
+    assert trajectory.feasible, trajectory.violations
+    # The planner lowers both endpoints to speeds that can physically be joined.
+    assert trajectory.samples[0].v < 3.0 and trajectory.samples[-1].v < 2.0
+    assert trajectory.samples[0].v >= 0.0 and trajectory.samples[-1].v >= 0.0
+    v_peak, a_peak, j_peak = _profile_peaks(trajectory)
+    assert a_peak <= 2.0 + 1e-6 and j_peak <= 1.0 + 1e-6
+
+
+def test_infinite_jerk_reproduces_acceleration_limited_profile():
+    points = [(0.0, 0.0), (0.25, 0.0), (0.5, 0.0)]
+    trajectory = time_parameterize(points, max_speed=2.0, max_accel=0.5,
+                                   max_jerk=math.inf)
+    assert trajectory.feasible
+    assert math.isinf(trajectory.max_jerk)
+    assert trajectory.to_dict()['max_jerk'] is None
+    _v_peak, a_peak, _j_peak = _profile_peaks(trajectory)
+    assert a_peak <= 0.5 + 1e-6
+
+
+def test_jerk_parameter_must_be_positive():
+    points = [(0.0, 0.0), (1.0, 0.0)]
+    with pytest.raises(ValueError):
+        time_parameterize(points, max_speed=1.0, max_accel=1.0, max_jerk=0.0)
+
+
 # ------------------------------------------------------------------------------ predict
 def test_swept_segment_catches_collision_between_waypoints():
     obstacles = [CircleObstacle(3.0, 0.0, 0.5)]
